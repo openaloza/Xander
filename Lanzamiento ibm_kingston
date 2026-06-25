@@ -1,0 +1,183 @@
+import os
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
+
+# =====================================================================
+# 1. VARIABLES DE CONFIGURACIÓN PERSONALIZADAS (USER CONFIG)
+# =====================================================================
+IBM_API_TOKEN = ""
+IBM_INSTANCE = ""
+IBM_RUNTIME_CHANNEL = ""
+IBM_BACKEND = "ibm_kingston"
+USE_REAL_QPU = 1  # 1 = QPU física (ibm_kingston), 0 = simulador local Aer
+
+# Configuración fija del Sweet Spot (6 Qubits / 2500 Muestras)
+DATASET_PATH = "C:/Users/Acer/Downloads/ACTIVIDADES/Quantum/Proyecto_UNIR/UpdateIBMQ1/hybrid_pipeline_ibm2/X_y_resampled_sampled_20000.csv"
+N_SAMPLES = 200
+N_QUBITS = 6
+N_ANCHORS = 5
+BATCH_SIZE = 900  
+SHOTS = 1024
+
+print("[INFO] Iniciando pipeline cuántico optimizado...")
+
+# =====================================================================
+# 2. PREPROCESAMIENTO DE DATOS CLÁSICOS
+# =====================================================================
+df = pd.read_csv(DATASET_PATH)
+X = df.drop(columns=['target']).values if 'target' in df.columns else df.iloc[:, :-1].values
+y = df['target'].values if 'target' in df.columns else df.iloc[:, -1].values
+
+# Submuestreo Estratificado
+X_sample, _, y_sample, _ = train_test_split(
+    X, y, train_size=N_SAMPLES, stratify=y, random_state=42
+)
+
+# PCA Extendido a 6 Componentes
+pca = PCA(n_components=N_QUBITS)
+X_pca = pca.fit_transform(X_sample)
+# CORREGIDO: cambiado explained_variance_ratio__ por explained_variance_ratio_
+print(f"[OK] PCA completado. Varianza conservada: {pca.explained_variance_ratio_.sum() * 100:.2f}%")
+
+# División Train/Test (500 muestras de evaluación estricta)
+X_train, X_test, y_train, y_test = train_test_split(
+    X_pca, y_sample, test_size=50, stratify=y_sample, random_state=42
+)
+
+# Selección de Puntos de Anclaje de Nyström 
+idx_anchors = np.random.choice(len(X_train), size=N_ANCHORS, replace=False)
+X_anchors = X_train[idx_anchors]
+
+# =====================================================================
+# 3. GESTIÓN DEL ENTORNO DE EJECUCIÓN (QPU VS SIMULADOR)
+# =====================================================================
+if USE_REAL_QPU == 1:
+    from qiskit_ibm_runtime import QiskitRuntimeService, SamplerV2
+    try:
+        service = QiskitRuntimeService(
+            channel=IBM_RUNTIME_CHANNEL, 
+            token=IBM_API_TOKEN, 
+            instance=IBM_INSTANCE
+        )
+        backend = service.backend(IBM_BACKEND)
+        
+        # Configuración para la QPU Real (vía objeto options)
+        sampler = SamplerV2(mode=backend)
+        sampler.options.default_shots = SHOTS 
+        print(f"[OK] Modo activo: HARDWARE REAL ({IBM_BACKEND}) vía IBM Cloud.")
+    except Exception as e:
+        print(f"[ERROR] Error de inicialización en IBM Cloud: {e}")
+        raise e
+else:
+    from qiskit.primitives import StatevectorSampler
+    
+    # CORREGIDO: El simulador local recibe 'default_shots' directamente en el constructor
+    sampler = StatevectorSampler(default_shots=SHOTS)
+    backend = None
+    print("[OK] Modo activo: SIMULADOR LOCAL (StatevectorSampler).")
+    
+# =====================================================================
+# 4. FUNCIÓN GENERADORA DEL CIRCUITO (CON REGISTRO CLÁSICO NOMBRADO)
+# =====================================================================
+def build_kernel_circuit(x1, x2):
+    qr = QuantumRegister(N_QUBITS, name="q_reg")
+    cr = ClassicalRegister(N_QUBITS, name="c_reg")  # Requisito indispensable SamplerV2
+    qc = QuantumCircuit(qr, cr)
+    
+    # Inyección de Datos 1: U(x1)
+    for i in range(N_QUBITS):
+        qc.ry(x1[i], qr[i])
+    for i in range(N_QUBITS - 1):
+        qc.cx(qr[i], qr[i+1])
+        
+    qc.barrier()
+    
+    # Inyección Inversa de Datos 2: U_dagger(x2)
+    for i in range(N_QUBITS - 2, -1, -1):
+        qc.cx(qr[i], qr[i+1])
+    for i in range(N_QUBITS):
+        qc.ry(-x2[i], qr[i])
+        
+    qc.measure(qr, cr)
+    return qc
+
+# =====================================================================
+# 5. GENERACIÓN Y DISPACHO EN LOTES
+# =====================================================================
+print("[INFO] Construyendo juego de circuitos cuánticos...")
+all_circuits = []
+
+# Matriz Entrenamiento (2000 * 50 = 100,000 pares)
+for x_t in X_train:
+    for x_a in X_anchors:
+        all_circuits.append(build_kernel_circuit(x_t, x_a))
+
+# Matriz Prueba (500 * 50 = 25,000 pares)
+for x_te in X_test:
+    for x_a in X_anchors:
+        all_circuits.append(build_kernel_circuit(x_te, x_a))
+
+total_circuits = len(all_circuits)
+print(f"[INFO] Total de circuitos preparados: {total_circuits}")
+
+job_ids = []
+print(f"[INFO] Procesando y enviando en ráfagas de {BATCH_SIZE} circuitos...")
+
+for i in range(0, total_circuits, BATCH_SIZE):
+    batch = all_circuits[i : i + BATCH_SIZE]
+    
+    if USE_REAL_QPU == 1:
+        # Transpilación acoplada al mapa de conectividad de la QPU real
+        transpiled_batch = transpile(batch, backend=backend, optimization_level=1)
+        # CORREGIDO: .run() ya no acepta 'shots' como parámetro directo
+        job = sampler.run(transpiled_batch)
+        job_ids.append(job.job_id())
+        print(f"   -> Lote {i // BATCH_SIZE + 1} enviado a la nube. Job ID: {job.job_id()}")
+    else:
+        # En el simulador local de referencia no se requiere transpilación de hardware
+        job = sampler.run(batch)
+        _ = job.result()
+        print(f"   -> Lote {i // BATCH_SIZE + 1} simulado localmente con éxito.")
+
+# =====================================================================
+# 6. GUARDADO DE IDENTIFICADORES DE CONTROL (CORREGIDO)
+# =====================================================================
+if USE_REAL_QPU == 1:
+    if len(job_ids) > 0:
+        with open("ibm_cloud_job_ids.txt", "w") as f:
+            for j_id in job_ids:
+                f.write(f"{j_id}\n")
+        print("\n[OK] ¡Todos los trabajos han sido enviados con éxito a ibm_kingston!")
+        print(f"[INFO] Se despacharon {len(job_ids)} lotes en total a tu instancia de IBM Cloud.")
+        print("[INFO] Los IDs de rastreo se guardaron en 'ibm_cloud_job_ids.txt'.")
+    else:
+        print("\n[ALERTA] Modo QPU activo pero no se llegó a registrar ningún Job ID.")
+else:
+    print("\n[OK] Simulación local concluida exitosamente al 100%.")
+    print("[INFO] Como corriste en local, no se generaron Job IDs ni se alteró el archivo de texto.")
+
+
+# =====================================================================
+# 7. VISUALIZACIÓN DEL CIRCUITO CUÁNTICO REPRESENTATIVO
+# =====================================================================
+print("\n[INFO] Generando representación visual del circuito cuántico...")
+
+# Tomamos el primer dato de entrenamiento y el primer punto de anclaje como ejemplo
+ejemplo_x1 = X_train[0]
+ejemplo_x2 = X_anchors[0]
+
+# Construimos el circuito para este par específico
+circuito_muestra = build_kernel_circuit(ejemplo_x1, ejemplo_x2)
+
+# Opción A: Dibujo en formato Texto (Funciona en cualquier terminal/consola)
+print("\n--- DIAGRAMA DEL CIRCUITO (FORMATO TEXTO) ---")
+print(circuito_muestra.draw(output='text'))
+
+# Opción B: Dibujo Gráfico Avanzado (Descomenta las líneas de abajo si usas Jupyter y tienes matplotlib)
+import matplotlib.pyplot as plt
+print("\n[INFO] Renderizando diagrama gráfico...")
+circuito_muestra.draw(output='mpl', style='iqp')
+plt.show()
