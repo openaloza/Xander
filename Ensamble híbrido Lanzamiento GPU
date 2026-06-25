@@ -1,0 +1,980 @@
+"""
+Pipeline completo final optimizado: QSVM + VQC + QCNN-like + Ensemble + fallbacks clásicos + métricas y gráficas.
+Incluye: calibración, búsqueda de pesos del ensemble (grid), ajuste de umbral (threshold tuning), logs detallados.
+Ajusta rutas, variables.env e hyperparámetros según tu entorno.
+"""
+
+import os
+import time
+import logging
+import json
+from functools import wraps
+from typing import List, Dict, Tuple
+import itertools
+
+import numpy as np
+import pandas as pd
+from sklearn.utils import resample
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (accuracy_score, f1_score, precision_score, recall_score,
+                             classification_report, confusion_matrix, roc_curve, auc)
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+
+import joblib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from dotenv import load_dotenv
+load_dotenv("variables.env", override=True)
+
+from xgboost import XGBClassifier
+
+# Reproducibilidad
+GLOBAL_SEED = 42
+np.random.seed(GLOBAL_SEED)
+
+# Intento de importaciones opcionales (Qiskit, psutil, torch)
+HAS_QISKIT = True
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, TensorDataset
+except Exception:
+    torch = None
+
+try:
+    from qiskit import QuantumCircuit
+    from qiskit.primitives import Estimator
+    from qiskit_machine_learning.neural_networks import EstimatorQNN
+    from qiskit_machine_learning.connectors import TorchConnector
+    from qiskit.circuit.library import ZZFeatureMap, PauliFeatureMap, EfficientSU2
+    from qiskit_machine_learning.kernels import QuantumKernel, FidelityQuantumKernel
+    from qiskit.circuit import Parameter, ParameterVector
+    from qiskit_ibm_runtime import QiskitRuntimeService, Session, Options
+    from qiskit_ibm_runtime import Estimator as RuntimeEstimator, Sampler as RuntimeSampler
+except Exception:
+    HAS_QISKIT = False
+
+HAS_PSUTIL = True
+try:
+    import psutil
+except Exception:
+    psutil = None
+    HAS_PSUTIL = False
+
+# Registro
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logger = logging.getLogger("PipelineDeEnsamblajeCompleto")
+
+
+def trace(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        logger.info("START %s", func.__name__)
+        t0 = time.time()
+        res = func(*args, **kwargs)
+        t1 = time.time()
+        logger.info("END   %s (t=%.2f s)", func.__name__, t1 - t0)
+        return res
+    return wrapper
+
+# -------------------------
+# 1) Carga y preprocesamiento de datos
+# -------------------------
+@trace
+def load_and_preprocess(path_csv: str,
+                        pca_components: int = 6,
+                        max_samples_per_class: int = 2000,
+                        random_state: int = GLOBAL_SEED) -> Tuple[np.ndarray, np.ndarray, LabelEncoder, PCA, StandardScaler, List[str]]:
+    df = pd.read_csv(path_csv)
+    if "label" not in df.columns:
+        raise ValueError("CSV must contain 'label' column.")
+    X = df.drop(columns=["label"]).values
+    y = df["label"].values
+    logger.info("Datos cargados: X=%s, y=%s", X.shape, y.shape)
+
+    # -----------------------------
+    # Balanceo controlado (undersample/oversample simple)
+    # -----------------------------
+    X_parts, y_parts = [], []
+    for lbl in np.unique(y):
+        Xc = X[y == lbl]
+        yc = y[y == lbl]
+        if len(Xc) > max_samples_per_class:
+            Xr, yr = resample(Xc, yc, n_samples=max_samples_per_class, random_state=random_state)
+        else:
+            n_target = min(max_samples_per_class, max(len(Xc) * 2, len(Xc)))
+            Xr, yr = resample(Xc, yc, n_samples=n_target, replace=True, random_state=random_state)
+        X_parts.append(Xr)
+        y_parts.append(yr)
+
+    X_bal = np.vstack(X_parts)
+    y_bal = np.hstack(y_parts)
+    unique, counts = np.unique(y_bal, return_counts=True)
+    logger.info("Dataset balanceado por clase: %s", dict(zip(unique, counts)))
+
+    # -----------------------------
+    # PCA + escalado
+    # -----------------------------
+    pca = PCA(n_components=min(pca_components, X_bal.shape[1]), random_state=random_state)
+    X_pca = pca.fit_transform(X_bal)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_pca)
+
+    # -----------------------------
+    # Codificación de etiquetas
+    # -----------------------------
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y_bal)
+    n_classes = len(le.classes_)
+
+    class_names = le.classes_.astype(str).tolist()
+    logger.info(f"Clases detectadas: {class_names} (n={n_classes})")
+
+    return X_scaled, y_enc, le, pca, scaler, class_names
+
+# -------------------------
+# 2) Constructor de mapas de características
+# -------------------------
+def build_feature_map(name: str, feature_dim: int, reps: int = 2):
+    if not HAS_QISKIT:
+        raise RuntimeError("Qiskit no disponible.")
+    name = name.lower()
+    if name == "zz":
+        return ZZFeatureMap(feature_dimension=feature_dim, reps=reps, entanglement='full')
+    if name == "pauli":
+        return PauliFeatureMap(feature_dimension=feature_dim, reps=reps, paulis=['X','Y','Z'], entanglement='full')
+    raise ValueError("Unknown feature map: choose 'zz' or 'pauli'")
+
+# -------------------------
+# 3) Backend factory (Estimator / QuantumInstance)
+# -------------------------
+def get_estimator_backend(use_ibm_runtime: bool = False,
+                          backend_name: str = "ibm_torino",
+                          shots: int = 1024):
+    if not HAS_QISKIT:
+        logger.warning("Qiskit no está presente -> la fábrica de backends devolverá None.")
+        return None
+
+    try:
+        if use_ibm_runtime:
+            IBM_TOKEN = os.getenv("IBM_API_TOKEN")
+            IBM_INSTANCE = os.getenv("IBM_INSTANCE")
+            if not IBM_TOKEN:
+                raise RuntimeError("IBM_API_TOKEN no configurado en env")
+            service = QiskitRuntimeService(channel="ibm_cloud", token=IBM_TOKEN, instance=IBM_INSTANCE)
+            backend = service.backend(backend_name)
+            session = Session(service=service, backend=backend)
+            options = Options(resilience_level=1, optimization_level=3)
+            estimator = RuntimeEstimator(session=session, options=options)
+            logger.info("RuntimeEstimator created for %s", backend_name)
+            return {"runtime_estimator": estimator,
+                    "runtime_session": session,
+                    "runtime_options": options,
+                    "quantum_instance": None}
+        else:
+            from qiskit import Aer
+            from qiskit.utils import QuantumInstance
+            try:
+                aer_backend = Aer.get_backend("aer_simulator_statevector")
+            except Exception:
+                aer_backend = Aer.get_backend("aer_simulator")
+            qi = QuantumInstance(aer_backend, shots=shots)
+            logger.info("QuantumInstance created on AerSimulator")
+            return {"runtime_estimator": None, "runtime_session": None, "runtime_options": None, "quantum_instance": qi}
+    except Exception as e:
+        logger.exception("Error al crear el backend del estimador: %s", e)
+        return None
+
+# -------------------------
+# 4) QSVM trainer (with fallback) - entrenador (con opción alternativa)
+# -------------------------
+class QSVMKernelWrapper:
+    def __init__(self, qkernel): self.qkernel = qkernel
+    def __call__(self, X, Y): return self.qkernel.evaluate(X, Y)
+
+@trace
+def train_qsvm(X_train, y_train, feature_map_name="zz", backend=None, use_ibm_runtime=False, C=3.0, fallback_seed: int = GLOBAL_SEED):
+    if not HAS_QISKIT or backend is None:
+        logger.warning("La ruta cuántica QSVM no está disponible -> usando la alternativa clásica SVC.")
+        clf = SVC(kernel='rbf', probability=True, C=C, random_state=fallback_seed)
+        clf.fit(X_train, y_train)
+        return clf, {"fallback": True, "type": "SVC_rbf"}
+    try:
+        feature_map = build_feature_map(feature_map_name, X_train.shape[1], reps=3)
+        if use_ibm_runtime:
+            sampler = RuntimeSampler(session=backend["runtime_session"], options=backend["runtime_options"])
+            qkernel = FidelityQuantumKernel(feature_map=feature_map, fidelity=sampler)
+            logger.info("Núcleo Cuántico de Fidelity creado (muestreador en tiempo de ejecución).")
+        else:
+            qkernel = QuantumKernel(feature_map=feature_map, quantum_instance=backend["quantum_instance"])
+            logger.info("QuantumKernel creado (instancia cuántica local).")
+        kernel_wrapper = QSVMKernelWrapper(qkernel)
+        clf = SVC(kernel=kernel_wrapper, C=C, probability=True)
+        clf.fit(X_train, y_train)
+        return clf, {
+            "fallback": False,
+            "qkernel": "QuantumKernel",
+            "feature_map": str(type(feature_map).__name__)
+        }
+    except Exception as e:
+        logger.exception("El entrenamiento de QSVM falló, regresando al SVC clásico: %s", e)
+        clf = SVC(kernel='rbf', probability=True, random_state=fallback_seed)
+        clf.fit(X_train, y_train)
+        return clf, {"fallback": True, "type": "SVC_rbf"}
+
+# -------------------------
+# 5) VQC & QCNN trainers (with fallback) - entrenadores (con alternativa)
+# -------------------------
+# Modelo de respaldo MLP simple de PyTorch (usado si Qiskit no está disponible)
+class SimpleMLP(nn.Module):
+    def __init__(self, input_dim, n_classes, hidden=[64,32]):
+        super().__init__()
+        layers = []
+        prev = input_dim
+        for h in hidden:
+            layers.append(nn.Linear(prev, h)); layers.append(nn.ReLU()); layers.append(nn.Dropout(0.2))
+            prev = h
+        layers.append(nn.Linear(prev, n_classes))
+        self.net = nn.Sequential(*layers)
+    def forward(self, x): return self.net(x)
+
+def build_qnn_circuit_and_qnn(feature_map_name, ansatz_type, feature_dim, backend, use_ibm_runtime=False):
+    if not HAS_QISKIT:
+        raise RuntimeError("Qiskit no está disponible para redes neuronales cuánticas.")
+    feature_map = build_feature_map(feature_map_name, feature_dim, reps=1)
+    if ansatz_type == "efficientsu2":
+        ansatz = EfficientSU2(num_qubits=feature_dim, reps=2, entanglement='full')
+    else:
+        ansatz = EfficientSU2(num_qubits=feature_dim, reps=1, entanglement='full')
+
+    x_params = ParameterVector("x", len(feature_map.parameters))
+    w_params = ParameterVector("w", len(ansatz.parameters))
+    fm = feature_map.assign_parameters({p: x_params[i] for i, p in enumerate(feature_map.parameters)})
+    an = ansatz.assign_parameters({p: w_params[i] for i, p in enumerate(ansatz.parameters)})
+
+    qc = QuantumCircuit(feature_dim)
+    qc.compose(fm, inplace=True)
+    qc.compose(an, inplace=True)
+
+    qnn = EstimatorQNN(circuit=qc, input_params=x_params, weight_params=w_params,
+                       estimator=backend["runtime_estimator"] if use_ibm_runtime else Estimator())
+    return qnn, feature_map, ansatz
+
+# Definición del modelo híbrido (VQC + capa clásica)
+class HybridVQC(nn.Module):
+    def __init__(self, qnn, n_classes):
+        super().__init__()
+        self.qnn = TorchConnector(qnn)
+        self.classifier = nn.Sequential(
+            nn.Linear(1, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, n_classes)
+        )
+    def forward(self, x):
+        out = self.qnn(x)
+        if out.dim() == 1:
+            out = out.unsqueeze(1)
+        return self.classifier(out)
+
+@trace
+def train_vqc(X_train, y_train, n_classes,
+              feature_map_name="pauli",
+              reps_feature=1, reps_ansatz=1,
+              batch_size=8, max_epochs=10, patience=5,
+              lr=3e-4, backend=None, use_ibm_runtime=False, device="cpu", fallback_seed: int = GLOBAL_SEED):
+    if torch is not None:
+        torch.manual_seed(fallback_seed)
+        torch.use_deterministic_algorithms(False)
+
+    if (not HAS_QISKIT) or (torch is None) or (backend is None):
+        logger.warning("Ruta cuántica VQC no disponible -> usando alternativa clásica MLP.")
+        mlp = SimpleMLP(input_dim=X_train.shape[1], n_classes=n_classes, hidden=[64,32])
+        device = torch.device(device) if torch is not None else "cpu"
+        if torch is None:
+            clf = MLPClassifier(hidden_layer_sizes=(64,32), max_iter=200, random_state=fallback_seed)
+            clf.fit(X_train, y_train)
+            return clf, {"fallback": True, "type": "sklearn_mlp"}
+        mlp.to(device)
+        opt = optim.AdamW(mlp.parameters(), lr=lr)
+        crit = nn.CrossEntropyLoss()
+        loader = DataLoader(TensorDataset(torch.tensor(X_train,dtype=torch.float32),
+                                          torch.tensor(y_train,dtype=torch.long)),
+                            batch_size=batch_size, shuffle=True)
+        best_loss, wait = float("inf"), 0
+        for epoch in range(max_epochs):
+            mlp.train(); total_loss = 0.
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                opt.zero_grad(); logits = mlp(xb); loss = crit(logits, yb)
+                loss.backward(); opt.step(); total_loss += loss.item()
+            if total_loss < best_loss - 1e-4:
+                best_loss, wait = total_loss, 0
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+        return mlp, {"fallback": True, "type": "torch_mlp"}
+
+    try:
+        qnn, fmap, ansatz = build_qnn_circuit_and_qnn(feature_map_name, "efficientsu2", X_train.shape[1], backend, use_ibm_runtime)
+        hybrid = HybridVQC(qnn, n_classes)
+        device = torch.device(device)
+        hybrid.to(device)
+        opt = optim.AdamW(hybrid.parameters(), lr=lr, weight_decay=1e-4)
+        crit = nn.CrossEntropyLoss()
+        loader = DataLoader(TensorDataset(torch.tensor(X_train,dtype=torch.float32), torch.tensor(y_train,dtype=torch.long)),
+                            batch_size=batch_size, shuffle=True)
+        best_loss, wait = float("inf"), 0
+        for epoch in range(max_epochs):
+            hybrid.train(); total_loss = 0.
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                opt.zero_grad(); logits = hybrid(xb); loss = crit(logits, yb)
+                loss.backward(); opt.step(); total_loss += loss.item()
+            if total_loss < best_loss - 1e-4:
+                best_loss, wait = total_loss, 0
+                torch.save(hybrid.state_dict(), "mejor_vqc_híbrido.pth")
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+        return hybrid, {
+            "fallback": False,
+            "qnn": "EstimatorQNN",
+            "fmap": str(type(fmap).__name__),
+            "ansatz": str(type(ansatz).__name__)
+        }
+    except Exception as e:
+        logger.exception("El entrenamiento cuántico VQC falló, recurriendo a MLP clásico: %s", e)
+        clf = MLPClassifier(hidden_layer_sizes=(64,32), max_iter=200, random_state=fallback_seed)
+        clf.fit(X_train, y_train)
+        return clf, {"fallback": True, "type": "sklearn_mlp"}
+
+
+@trace
+def train_qcnn_like(X_train, y_train, n_classes, backend, use_ibm_runtime=False,
+                    batch_size=8, max_epochs=10, patience=5, device="cpu", fallback_seed: int = GLOBAL_SEED):
+    if not HAS_QISKIT or backend is None:
+        logger.warning("Ruta cuántica de QCNN no disponible -> usando clasificador de reserva clásico (RandomForest).")
+        clf = RandomForestClassifier(n_estimators=200, random_state=fallback_seed)
+        clf.fit(X_train, y_train)
+        return clf, {"fallback": True, "type": "rf"}
+
+    try:
+        feature_dim = X_train.shape[1]
+
+        feature_map = ZZFeatureMap(feature_dimension=feature_dim, reps=1, entanglement="linear")
+
+        qc = QuantumCircuit(feature_dim)
+        params = []
+
+        for i in range(0, feature_dim-1, 2):
+            theta1, theta2 = Parameter(f"\u03b8_{i}"), Parameter(f"\u03b8_{i+1}")
+            qc.ry(theta1, i)
+            qc.cx(i, i+1)
+            qc.ry(theta2, i+1)
+            params.extend([theta1, theta2])
+
+        for i in range(feature_dim-1):
+            qc.cz(i, i+1)
+
+        x_params = ParameterVector("x", len(feature_map.parameters))
+        w_params = ParameterVector("w", len(params))
+
+        fm = feature_map.assign_parameters({p: x_params[i] for i, p in enumerate(feature_map.parameters)})
+        an = qc.assign_parameters({p: w_params[i] for i, p in enumerate(params)})
+
+        circuit = QuantumCircuit(feature_dim)
+        circuit.compose(fm, inplace=True)
+        circuit.compose(an, inplace=True)
+
+        qnn = EstimatorQNN(
+            circuit=circuit,
+            input_params=x_params,
+            weight_params=w_params,
+            estimator=backend["runtime_estimator"] if use_ibm_runtime else Estimator()
+        )
+
+        class HybridQCNN(nn.Module):
+            def __init__(self, qnn_module, n_classes):
+                super().__init__()
+                self.qnn = TorchConnector(qnn_module)
+                self.classifier = nn.Sequential(
+                    nn.Linear(1, 128),
+                    nn.ReLU(),
+                    nn.Dropout(0.1),
+                    nn.Linear(128, n_classes)
+                )
+            def forward(self, x):
+                out = self.qnn(x)
+                if out.dim() == 1:
+                    out = out.unsqueeze(1)
+                return self.classifier(out)
+
+        hybrid = HybridQCNN(qnn, n_classes)
+
+        device = torch.device(device)
+        hybrid.to(device)
+        opt = optim.AdamW(hybrid.parameters(), lr=3e-4, weight_decay=1e-4)
+        crit = nn.CrossEntropyLoss()
+        loader = DataLoader(TensorDataset(torch.tensor(X_train, dtype=torch.float32),
+                                          torch.tensor(y_train, dtype=torch.long)),
+                            batch_size=batch_size, shuffle=True)
+
+        best_loss, wait = float("inf"), 0
+        for epoch in range(max_epochs):
+            hybrid.train(); total_loss = 0.
+            for xb, yb in loader:
+                xb, yb = xb.to(device), yb.to(device)
+                opt.zero_grad(); logits = hybrid(xb); loss = crit(logits, yb)
+                loss.backward(); opt.step(); total_loss += loss.item()
+            if total_loss < best_loss - 1e-4:
+                best_loss, wait = total_loss, 0
+                torch.save(hybrid.state_dict(), "mejor_qcnn_híbrido.pth")
+            else:
+                wait += 1
+                if wait >= patience:
+                    break
+
+        return hybrid, {
+            "fallback": False,
+            "qnn": "EstimatorQNN",
+            "fmap": str(type(feature_map).__name__),
+            "ansatz": "QCNN-like"
+        }
+
+    except Exception as e:
+        logger.exception("El entrenamiento de QCNN falló, volviendo a RandomForest: %s", e)
+        clf = RandomForestClassifier(n_estimators=200, random_state=fallback_seed)
+        clf.fit(X_train, y_train)
+        return clf, {"fallback": True, "type": "rf"}
+
+
+@trace
+def train_xgboost(X_train, y_train, fallback_seed: int = GLOBAL_SEED):
+    n_classes = len(np.unique(y_train))
+    if n_classes > 2:
+        clf = XGBClassifier(
+            n_estimators=400, max_depth=7, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+            objective='multi:softprob', num_class=n_classes,
+            eval_metric='mlogloss',
+            random_state=fallback_seed, use_label_encoder=False
+        )
+    else:
+        clf = XGBClassifier(
+            n_estimators=400, max_depth=7, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
+            objective='binary:logistic',
+            eval_metric='logloss',
+            random_state=fallback_seed, use_label_encoder=False
+        )
+    clf.fit(X_train, y_train)
+    return clf
+
+
+# -------------------------
+# Utility: predictions, proba wrappers for sklearn/torch models - Utilidad: predicciones, envoltorios de probabilidad para modelos de sklearn/torch
+# -------------------------
+def predict_proba_model(model, X_np, batch=32, device="cpu") -> np.ndarray:
+    try:
+        if hasattr(model, "predict_proba"):
+            return model.predict_proba(X_np)
+    except Exception:
+        pass
+
+    if torch is not None and isinstance(model, torch.nn.Module):
+        model.eval()
+        ps = []
+        with torch.no_grad():
+            for i in range(0, X_np.shape[0], batch):
+                xb = torch.tensor(X_np[i:i+batch], dtype=torch.float32).to(device)
+                logits = model(xb)
+                probs = torch.softmax(logits, dim=1).cpu().numpy()
+                ps.append(probs)
+        return np.vstack(ps)
+
+    if hasattr(model, "decision_function"):
+        scores = model.decision_function(X_np)
+        if scores.ndim == 1:
+            scores = np.vstack([-scores, scores]).T
+        exp = np.exp(scores - np.max(scores, axis=1, keepdims=True))
+        probs = exp / exp.sum(axis=1, keepdims=True)
+        return probs
+
+    preds = model.predict(X_np)
+    n_classes = int(np.max(preds)) + 1
+    proba = np.zeros((preds.shape[0], n_classes))
+    proba[np.arange(preds.shape[0]), preds] = 1.0
+    return proba
+
+
+# -------------------------
+# 6) Ensemble strategies - Ensamblado de estrategias
+# -------------------------
+def ensemble_predict_proba(models_probas: List[np.ndarray], strategy: str = "soft") -> np.ndarray:
+    strategy = strategy.lower()
+    stack = np.stack(models_probas, axis=0)
+    if strategy == "soft":
+        return np.mean(stack, axis=0)
+    if strategy == "hard":
+        preds = np.argmax(stack, axis=2)
+        from scipy.stats import mode
+        maj = mode(preds, axis=0, keepdims=False)[0].flatten()
+        onehot = np.zeros((maj.size, stack.shape[2]))
+        onehot[np.arange(maj.size), maj] = 1.0
+        return onehot
+    if strategy == "functional":
+        soft = np.mean(stack, axis=0)
+        preds = np.argmax(stack, axis=2)
+        from scipy.stats import mode
+        maj = mode(preds, axis=0, keepdims=False)[0].flatten()
+        hard_onehot = np.zeros_like(soft)
+        hard_onehot[np.arange(soft.shape[0]), maj] = 1.0
+        return 0.7 * soft + 0.3 * hard_onehot
+    raise ValueError("Estrategia de ensamblado desconocida")
+
+# -------------------------
+# 7) Evaluation & plots - Evaluación y gráficas
+# -------------------------
+def evaluate_model(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray,
+                   model_name: str, label_names: List[str], out_dir: str = "./salidas") -> Dict:
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not all(isinstance(c, str) for c in label_names):
+        label_names = [str(c) for c in label_names]
+
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, average="weighted", zero_division=0)
+    rec = recall_score(y_true, y_pred, average="weighted", zero_division=0)
+    f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
+
+    report = classification_report(y_true, y_pred,
+                                   target_names=label_names,
+                                   zero_division=0)
+    logger.info("Reporte para %s:\n%s", model_name, report)
+
+    cm = confusion_matrix(y_true, y_pred)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=label_names, yticklabels=label_names)
+    plt.title(f"Matriz de confusión - {model_name}")
+    plt.xlabel("Predicho")
+    plt.ylabel("Verdadero")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, f"{model_name}_confusion.png"))
+    plt.close()
+
+    try:
+        if y_proba.shape[1] == 2:
+            fpr, tpr, _ = roc_curve(y_true, y_proba[:, 1])
+            roc_auc = auc(fpr, tpr)
+        else:
+            fpr, tpr, roc_auc = None, None, None
+    except Exception:
+        fpr, tpr, roc_auc = None, None, None
+
+    return {
+        "accuracy": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "report": report,
+        "confusion": cm,
+        "proba": y_proba,
+        "roc": (fpr, tpr, roc_auc)
+    }
+
+# -------------------------
+# 8) Noise simulation & robustness curve - Simulación de ruido y curva de robustez
+# -------------------------
+def noise_robustness_curve(model_callable, X_test: np.ndarray, y_test: np.ndarray,
+                           noise_levels: List[float] = None, repeats: int = 3, **predict_kwargs):
+    if noise_levels is None:
+        noise_levels = np.linspace(0.0, 0.5, 6)
+    metrics = []
+    for sigma in noise_levels:
+        accs = []
+        for r in range(repeats):
+            X_noisy = X_test + np.random.normal(scale=sigma, size=X_test.shape)
+            proba = predict_proba_model(model_callable, X_noisy, **predict_kwargs) if callable(model_callable) else predict_proba_model(model_callable, X_noisy, **predict_kwargs)
+            preds = np.argmax(proba, axis=1)
+            accs.append(accuracy_score(y_test, preds))
+        metrics.append((sigma, np.mean(accs), np.std(accs)))
+    return metrics
+
+# -------------------------
+# 9) CPU / Memory snapshot - Instantánea de memoria
+# -------------------------
+def snapshot_resource_usage():
+    if not HAS_PSUTIL:
+        return {"porcentaje_cpu": None, "porcentaje_de_memoria": None}
+    return {"porcentaje_cpu": psutil.cpu_percent(interval=1.0), "porcentaje_de_memoria": psutil.virtual_memory().percent}
+
+# -------------------------
+# 10) Extras: calibration, grid weights, threshold tuning
+# -------------------------
+
+def calibrate_if_sklearn(clf, X_val, y_val):
+    try:
+        if hasattr(clf, "predict_proba"):
+            # try isotonic first
+            calib = CalibratedClassifierCV(base_estimator=clf, method='isotonic', cv='prefit')
+            calib.fit(X_val, y_val)
+            return calib
+        else:
+            return clf
+    except Exception:
+        try:
+            calib = CalibratedClassifierCV(base_estimator=clf, method='isotonic', cv=3)
+            calib.fit(X_val, y_val)
+            return calib
+        except Exception:
+            return clf
+
+
+def grid_search_ensemble_weights(prob_list_val: List[np.ndarray], y_val: np.ndarray, w_range=range(1,5)) -> np.ndarray:
+    prob_array = np.array(prob_list_val)  # (n_modelos, n_muestras, n_clases)
+    best = {"score": -1, "weights": None}
+    for w in itertools.product(w_range, repeat=prob_array.shape[0]):
+        w = np.array(w, dtype=float)
+        w = w / w.sum()
+        proba = np.tensordot(prob_array, w, axes=((0,), (0,)))
+        preds = np.argmax(proba, axis=1)
+        score = f1_score(y_val, preds, average='weighted')
+        if score > best['score']:
+            best['score'] = score
+            best['weights'] = w.copy()
+    logger.info("Mejores pesos del ensamble encontrados (grid): %s -> f1=%.4f", best['weights'], best['score'])
+    return best['weights']
+
+
+def threshold_tuning(ensemble_proba: np.ndarray, y_true: np.ndarray) -> Dict:
+    # Solo se implementó la afinación del umbral binario (extensión multiclase posible por clase)
+    out = {"best_threshold": None, "best_f1": None}
+    if ensemble_proba.shape[1] != 2:
+        return out
+    best_f1 = -1
+    best_t = 0.5
+    for t in np.linspace(0.3, 0.7, 41):
+        preds = (ensemble_proba[:, 1] >= t).astype(int)
+        score = f1_score(y_true, preds, average='weighted')
+        if score > best_f1:
+            best_f1 = score
+            best_t = t
+    out['best_threshold'] = float(best_t)
+    out['best_f1'] = float(best_f1)
+    logger.info("Resultado de ajuste del umbral: threshold=%.3f, f1=%.4f", best_t, best_f1)
+    return out
+
+# -------------------------
+# 11) Main full pipeline
+# -------------------------
+@trace
+def train_and_evaluate_full_pipeline(path_csv: str,
+                                     use_ibm_runtime: bool = False,
+                                     backend_name: str = "ibm_torino",
+                                     ensemble_strategy: str = "functional",
+                                     out_dir: str = "./salidas",
+                                     seeds: int = GLOBAL_SEED):
+    os.makedirs(out_dir, exist_ok=True)
+    np.random.seed(seeds)
+    if torch is not None:
+        torch.manual_seed(seeds)
+
+    # carga y división principal
+    X, y, label_enc, pca, scaler, class_names = load_and_preprocess(path_csv, pca_components=6, max_samples_per_class=2000)
+    X_train_full, X_test, y_train_full, y_test = train_test_split(X, y, test_size=0.2, stratify=y, random_state=seeds)
+
+    # crear una pequeña validación a partir del entrenamiento para calibración y búsqueda de pesos
+    X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.15, stratify=y_train_full, random_state=seeds)
+
+    backend = get_estimator_backend(use_ibm_runtime=use_ibm_runtime, backend_name=backend_name, shots=1024)
+
+    model_objects = {}
+    model_meta = {}
+    results = {}
+    train_times = {}
+    resource_snapshots = {}
+
+    # QSVM
+    t0 = time.time()
+    qsvm_model, qsvm_meta = train_qsvm(X_train, y_train, feature_map_name="zz", backend=backend, use_ibm_runtime=use_ibm_runtime, fallback_seed=seeds)
+    train_times["QSVM"] = time.time() - t0
+    model_objects["QSVM"] = qsvm_model
+    model_meta["QSVM"] = qsvm_meta
+    # calibrar QSVM si es compatible con sklearn
+    try:
+        qsvm_model = calibrate_if_sklearn(qsvm_model, X_val, y_val)
+        model_objects["QSVM"] = qsvm_model
+    except Exception:
+        pass
+    proba_qsvm = predict_proba_model(qsvm_model, X_test)
+    res_qsvm = evaluate_model(y_test, np.argmax(proba_qsvm, axis=1), proba_qsvm, "QSVM", label_enc.classes_, out_dir=out_dir)
+    results["QSVM"] = res_qsvm
+
+    # VQC
+    t0 = time.time()
+    vqc_model, vqc_meta = train_vqc(X_train, y_train, len(np.unique(y)), feature_map_name="pauli",
+                                    backend=backend, use_ibm_runtime=use_ibm_runtime, device="cpu", fallback_seed=seeds,
+                                    max_epochs=10)
+    train_times["VQC"] = time.time() - t0
+    model_objects["VQC"] = vqc_model
+    model_meta["VQC"] = vqc_meta
+    # no se pueden calibrar los modelos de Torch; confiar en sus salidas softmax
+    proba_vqc = predict_proba_model(vqc_model, X_test)
+    res_vqc = evaluate_model(y_test, np.argmax(proba_vqc, axis=1), proba_vqc, "VQC", label_enc.classes_, out_dir=out_dir)
+    results["VQC"] = res_vqc
+
+    # QCNN-like
+    t0 = time.time()
+    qcnn_model, qcnn_meta = train_qcnn_like(X_train, y_train, len(np.unique(y)), backend=backend, use_ibm_runtime=use_ibm_runtime,
+                                           batch_size=8, max_epochs=10, device="cpu", fallback_seed=seeds)
+    train_times["QCNN"] = time.time() - t0
+    model_objects["QCNN"] = qcnn_model
+    model_meta["QCNN"] = qcnn_meta
+    proba_qcnn = predict_proba_model(qcnn_model, X_test)
+    res_qcnn = evaluate_model(y_test, np.argmax(proba_qcnn, axis=1), proba_qcnn, "QCNN", label_enc.classes_, out_dir=out_dir)
+    results["QCNN"] = res_qcnn
+
+    # Bases sólidas clásicas
+    t0 = time.time()
+    svc_clf = SVC(kernel='rbf', probability=True, random_state=seeds)
+    svc_clf.fit(X_train, y_train)
+    svc_clf = calibrate_if_sklearn(svc_clf, X_val, y_val)
+    train_times["SVC_classic"] = time.time() - t0
+    proba_svc = predict_proba_model(svc_clf, X_test)
+    res_svc = evaluate_model(y_test, np.argmax(proba_svc, axis=1), proba_svc, "SVC_classic", label_enc.classes_, out_dir=out_dir)
+    results["SVC_classic"] = res_svc
+    model_objects["SVC_classic"] = svc_clf
+
+    t0 = time.time()
+    rf_clf = RandomForestClassifier(n_estimators=300, random_state=seeds)
+    rf_clf.fit(X_train, y_train)
+    rf_clf = calibrate_if_sklearn(rf_clf, X_val, y_val)
+    train_times["RF_classic"] = time.time() - t0
+    proba_rf = predict_proba_model(rf_clf, X_test)
+    res_rf = evaluate_model(y_test, np.argmax(proba_rf, axis=1), proba_rf, "RF_classic", label_enc.classes_, out_dir=out_dir)
+    results["RF_classic"] = res_rf
+    model_objects["RF_classic"] = rf_clf
+
+    t0 = time.time()
+    mlp_clf = MLPClassifier(hidden_layer_sizes=(128,64), max_iter=500, early_stopping=True, random_state=seeds)
+    mlp_clf.fit(X_train, y_train)
+    mlp_clf = calibrate_if_sklearn(mlp_clf, X_val, y_val)
+    train_times["MLP_classic"] = time.time() - t0
+    proba_mlp = predict_proba_model(mlp_clf, X_test)
+    res_mlp = evaluate_model(y_test, np.argmax(proba_mlp, axis=1), proba_mlp, "MLP_classic", label_enc.classes_, out_dir=out_dir)
+    results["MLP_classic"] = res_mlp
+    model_objects["MLP_classic"] = mlp_clf
+
+    t0 = time.time()
+    xgb_clf = train_xgboost(X_train, y_train, fallback_seed=seeds)
+    xgb_clf = calibrate_if_sklearn(xgb_clf, X_val, y_val)
+    train_times["XGB_classic"] = time.time() - t0
+    proba_xgb = predict_proba_model(xgb_clf, X_test)
+    res_xgb = evaluate_model(y_test, np.argmax(proba_xgb, axis=1), proba_xgb, "XGB_classic", label_enc.classes_, out_dir=out_dir)
+    results["XGB_classic"] = res_xgb
+    model_objects["XGB_classic"] = xgb_clf
+
+    # -----------------------------
+    # Grid search ensemble weights on validation set - Búsqueda en cuadrícula de pesos del conjunto en el conjunto de validación
+    # -----------------------------
+    logger.info("Iniciando búsqueda en cuadrícula para los pesos del conjunto en el conjunto de validación")
+    prob_list_val = [predict_proba_model(model_objects[k], X_val) if k in model_objects else None for k in ["QSVM","VQC","QCNN","RF_classic"]]
+    # asegurar el orden y eliminar None
+    valid_idx = [i for i,p in enumerate(prob_list_val) if p is not None]
+    prob_list_val = [prob_list_val[i] for i in valid_idx]
+    names_order = [k for i,k in enumerate(["QSVM","VQC","QCNN","RF_classic"]) if i in valid_idx]
+    best_weights = grid_search_ensemble_weights(prob_list_val, y_val)
+    # alinear best_weights de nuevo al orden completo (rellenar con 0 para los que faltan)
+    full_weights = np.zeros(4)
+    for idx, w in zip(valid_idx, best_weights):
+        full_weights[idx] = w
+    # normalizar
+    if full_weights.sum() == 0:
+        full_weights = np.array([2.0,2.0,1.0,1.0])
+    full_weights = full_weights / full_weights.sum()
+    logger.info("Pesos finales del conjunto aplicados (aligned): %s", full_weights)
+
+    # Ensemble probabilístico ponderado en test
+    prob_list_test = [results[k]["proba"] for k in ["QSVM","VQC","QCNN","RF_classic"]]
+    ensemble_proba = np.tensordot(prob_list_test, full_weights, axes=((0,), (0,)))
+
+    # Ajuste de umbral (binario)
+    thresh_info = threshold_tuning(ensemble_proba, y_test)
+    if thresh_info['best_threshold'] is not None:
+        t = thresh_info['best_threshold']
+        preds = (ensemble_proba[:,1] >= t).astype(int)
+        # convertir de nuevo a etiquetas de clase si es necesario
+        res_ens = evaluate_model(y_test, preds, ensemble_proba, "Ensemble", label_enc.classes_, out_dir=out_dir)
+    else:
+        res_ens = evaluate_model(y_test, np.argmax(ensemble_proba, axis=1), ensemble_proba, "Ensemble", label_enc.classes_, out_dir=out_dir)
+    results["Ensemble"] = res_ens
+
+    # ROC plot for all models (binary case draws curve) - Gráfico ROC para todos los modelos (caso binario dibuja la curva)
+    plt.figure(figsize=(8,6))
+    for name, rr in results.items():
+        proba = rr["proba"]
+        if proba is None:
+            continue
+        if proba.shape[1] == 2:
+            try:
+                fpr, tpr, _ = roc_curve(y_test, proba[:,1])
+                roc_auc = auc(fpr, tpr)
+                plt.plot(fpr, tpr, label=f"{name} (AUC={roc_auc:.2f})")
+            except Exception:
+                continue
+    plt.plot([0,1],[0,1],'k--'); plt.title("Curvas ROC"); plt.legend(); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "todas_ROC.png")); plt.close()
+
+    # Gráfico de tiempos de entrenamiento
+    plt.figure(figsize=(8,5))
+    names = list(train_times.keys())
+    times = [train_times[k] for k in names]
+    sns.barplot(x=names, y=times)
+    plt.ylabel("Seconds"); plt.title("Tiempos de entrenamiento"); plt.xticks(rotation=20); plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "tiempos_de_entrenamiento.png")); plt.close()
+
+    # Noise robustness curve for selected models (SVC_classic, Ensemble) - Curva de robustez al ruido para los modelos seleccionados (SVC_clásico, Conjunto)
+    noise_levels = np.linspace(0, 0.5, 6)
+    noise_metrics = {}
+    for name in ["SVC_classic", "Ensemble"]:
+        if name == "Ensemble":
+            model_callable = lambda X_np: np.tensordot([predict_proba_model(model_objects["QSVM"], X_np),
+                                                       predict_proba_model(model_objects["VQC"], X_np),
+                                                       predict_proba_model(model_objects["QCNN"], X_np),
+                                                       predict_proba_model(model_objects["RF_classic"], X_np)], full_weights, axes=((0,), (0,)))
+        else:
+            model_callable = model_objects[name]
+        points = []
+        for sigma in noise_levels:
+            accs = []
+            for _ in range(3):
+                Xn = X_test + np.random.normal(scale=sigma, size=X_test.shape)
+                proba = model_callable(Xn) if callable(model_callable) else predict_proba_model(model_callable, Xn)
+                preds = np.argmax(proba, axis=1)
+                accs.append(accuracy_score(y_test, preds))
+            points.append((sigma, np.mean(accs), np.std(accs)))
+        noise_metrics[name] = points
+        xs = [p[0] for p in points]; ys = [p[1] for p in points]
+        plt.plot(xs, ys, marker='o', label=name)
+    plt.xlabel("Ruido gaussiano sigma"); plt.ylabel("Accuracy"); plt.title("Robustez al ruido"); plt.legend(); plt.grid(True)
+    plt.savefig(os.path.join(out_dir, "Robustez_ruido.png")); plt.close()
+
+    # Resource snapshot - Instantánea de recursos
+    resource_snapshots = snapshot_resource_usage()
+    logger.info("Instantánea de recursos: %s", resource_snapshots)
+
+    # Guardar artefactos
+    joblib.dump(scaler, os.path.join(out_dir, "scaler.pkl"))
+    joblib.dump(pca, os.path.join(out_dir, "pca.pkl"))
+    joblib.dump(label_enc, os.path.join(out_dir, "label_encoder.pkl"))
+    for k, m in model_objects.items():
+        try:
+            joblib.dump(m, os.path.join(out_dir, f"{k}.joblib"))
+        except Exception:
+            if torch is not None and isinstance(m, torch.nn.Module):
+                torch.save(m.state_dict(), os.path.join(out_dir, f"{k}_torch.pth"))
+
+    # Guardar resumen de modelos/métricas
+    metrics_summary = []
+    for name, rr in results.items():
+        metrics_summary.append({
+            "model": name,
+            "accuracy": rr["accuracy"],
+            "precision": rr["precision"],
+            "recall": rr["recall"],
+            "f1": rr["f1"],
+            "fallback": model_meta.get(name, {}).get("fallback", False)
+        })
+    pd.DataFrame(metrics_summary).to_csv(os.path.join(out_dir, "resumen_metricas.csv"), index=False)
+
+    # Save a full log JSON (include ensemble weights and threshold info) - Guardar un registro completo en JSON (incluir pesos del conjunto e información del umbral)
+    summary = {"times": train_times, "resource": resource_snapshots, "metadata": model_meta, "ensemble_weights": full_weights.tolist(), "threshold": thresh_info}
+    with open(os.path.join(out_dir, "summary.json"), "w") as fh:
+        json.dump(summary, fh, indent=2)
+
+    logger.info("Flujo finalizado. Resumen de métricas guardado en %s", out_dir)
+    return results, train_times, resource_snapshots
+
+
+# -----------------------------
+# Extra: gráficas comparativas de métricas
+# -----------------------------
+# Nota: este bloque es independiente; 
+def plot_comparative_metrics(out_dir: str = "./salidas"):
+    df_metrics = pd.read_csv(os.path.join(out_dir, "resumen_metricas.csv"))
+
+    plt.figure(figsize=(10,6))
+    sns.barplot(x="model", y="accuracy", data=df_metrics, palette="viridis")
+    plt.title("Comparación de Accuracy entre modelos")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "comparativa_accuracy.png"))
+    plt.close()
+
+    plt.figure(figsize=(10,6))
+    sns.barplot(x="model", y="f1", data=df_metrics, palette="magma")
+    plt.title("Comparación de F1-score entre modelos")
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "comparativa_f1.png"))
+    plt.close()
+
+    try:
+        import math
+        metrics_for_radar = ["accuracy", "precision", "recall", "f1"]
+        N = len(metrics_for_radar)
+        for model_name in df_metrics["model"]:
+            values = df_metrics[df_metrics["model"] == model_name][metrics_for_radar].values.flatten().tolist()
+            values += values[:1]
+            angles = [n / float(N) * 2 * math.pi for n in range(N)]
+            angles += angles[:1]
+            plt.figure(figsize=(6,6))
+            ax = plt.subplot(111, polar=True)
+            ax.plot(angles, values, linewidth=2, linestyle='solid', label=model_name)
+            ax.fill(angles, values, alpha=0.25)
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(metrics_for_radar)
+            ax.set_yticks([0.2,0.4,0.6,0.8,1.0])
+            ax.set_yticklabels(["0.2","0.4","0.6","0.8","1.0"]) 
+            plt.title(f"Radar chart - {model_name}")
+            plt.legend(loc="upper right", bbox_to_anchor=(1.1, 1.1))
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"radar_{model_name}.png"))
+            plt.close()
+    except Exception as e:
+        logger.warning("Radar chart no generado: %s", e)
+
+
+# -------------------------
+# 11) Bloque de ejecución
+# -------------------------
+if __name__ == "__main__":
+    CSV_PATH = r"C:/Users/Acer/Downloads/ACTIVIDADES/Quantum/Proyecto_UNIR/Q_IDS/Data/X_y_resampled.csv"
+    OUT_DIR = "./salidas"
+
+    print("IBM_API_TOKEN:", os.getenv("IBM_API_TOKEN"))
+    print("IBM_INSTANCE:", os.getenv("IBM_INSTANCE"))
+    print("USE_REAL_QPU:", os.getenv("USE_REAL_QPU"))
+    print("IBM_BACKEND:", os.getenv("IBM_BACKEND"))
+    
+    USE_REAL = os.getenv("USE_REAL_QPU", "0") == "1"
+    BACKEND_NAME = os.getenv("IBM_BACKEND", "ibm_torino")
+    results, times, resources = train_and_evaluate_full_pipeline(CSV_PATH,
+                                                                 use_ibm_runtime=USE_REAL,
+                                                                 backend_name=BACKEND_NAME,
+                                                                 ensemble_strategy="functional",
+                                                                 out_dir=OUT_DIR,
+                                                                 seeds=GLOBAL_SEED)
+    print("Hecho. Métricas resumidas:")
+    for k,v in results.items():
+        print(k, v["accuracy"], v["f1"])
