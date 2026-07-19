@@ -1,0 +1,157 @@
+"""
+Pipeline_IBM_Optimizado.py
+Versión para IBM Quantum Open Plan (sin sesiones).
+
+- Compatible con qiskit-ibm-runtime==0.22.0 y qiskit==0.45.0
+- Fuerza la ejecución en el backend real de IBM cuando USE_REAL_QPU=1
+- Vuelve al simulador Aer si la conexión falla
+- Registra todos los eventos de ejecución, métricas y duraciones en ./outputs/runtime_log.txt
+"""
+
+import os
+import time
+import logging
+from pathlib import Path
+import runpy
+from dotenv import load_dotenv
+
+# === Configuración de registro ===
+out_dir = Path("./outputs")
+out_dir.mkdir(exist_ok=True)
+log_file = out_dir / "runtime_log.txt"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    ]
+)
+logger = logging.getLogger("PipelineIBMOptimized")
+
+# === Carga ambiente de variables ===
+env_path = Path("variables.env")
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path, override=False)
+    logger.info("Loaded environment from variables.env")
+else:
+    logger.info("variables.env not found; relying on OS environment variables")
+
+IBM_API_TOKEN = os.getenv("IBM_API_TOKEN")
+IBM_INSTANCE = os.getenv("IBM_INSTANCE")
+USE_REAL_QPU = os.getenv("USE_REAL_QPU", "0") == "1"
+IBM_BACKEND = os.getenv("IBM_BACKEND", "ibm_torino")
+BACKEND_NAME = IBM_BACKEND
+
+# === Importar módulos de Qiskit Runtime ===
+try:
+    from qiskit_ibm_runtime import QiskitRuntimeService, Estimator as RuntimeEstimator, Options
+    from qiskit_aer import Aer
+    HAS_QISKIT = True
+except Exception as e:
+    HAS_QISKIT = False
+    logger.exception("qiskit-ibm-runtime import failed: %s", e)
+    raise RuntimeError("qiskit-ibm-runtime not available or incompatible.") from e
+
+# === Verifica las credenciales y el modo ===
+if not IBM_API_TOKEN or not IBM_INSTANCE:
+    logger.error("IBM_API_TOKEN or IBM_INSTANCE missing. Check variables.env")
+    raise RuntimeError("Missing IBM Quantum credentials.")
+
+if USE_REAL_QPU:
+    logger.info(f"Attempting connection to IBM Quantum Cloud backend: {BACKEND_NAME}")
+    try:
+        service = QiskitRuntimeService(channel="ibm_cloud", token=IBM_API_TOKEN, instance=IBM_INSTANCE)
+        backend = service.backend(BACKEND_NAME)
+        queue = getattr(backend.status(), "pending_jobs", "unknown")
+        logger.info(f"Connected to IBM backend {BACKEND_NAME} (queue={queue})")
+        runtime_options = Options()
+        runtime_estimator = RuntimeEstimator(backend=backend, options=runtime_options)
+        mode = f"IBM Quantum real QPU ({BACKEND_NAME})"
+    except Exception as e:
+        logger.warning("Failed to connect to IBM Quantum backend. Falling back to Aer simulator: %s", e)
+        backend = Aer.get_backend("aer_simulator_statevector")
+        runtime_estimator = None
+        service = None
+        mode = "Local Aer simulator"
+else:
+    logger.info("USE_REAL_QPU=0 → running locally on Aer simulator.")
+    from qiskit_aer import Aer
+    backend = Aer.get_backend("aer_simulator_statevector")
+    runtime_estimator = None
+    service = None
+    mode = "Local Aer simulator"
+
+logger.info(f"Active backend mode: {mode}")
+
+# === Cargar el Ensamble ===
+pipeline_path = Path("Ensemble híbrido cuántico (QSVM, VQC, QCNN)-Copy1.txt")
+if not pipeline_path.exists():
+    raise FileNotFoundError("Ensemble file not found. Place it in the same folder.")
+
+logger.info(f"Loading ensemble pipeline from {pipeline_path.name} ...")
+pipeline_globals = runpy.run_path(str(pipeline_path))
+
+# Inject runtime context
+pipeline_globals["HAS_QISKIT"] = HAS_QISKIT
+pipeline_globals["use_ibm_runtime"] = USE_REAL_QPU
+pipeline_globals["backend_name"] = BACKEND_NAME
+pipeline_globals["service"] = service
+pipeline_globals["runtime_estimator"] = runtime_estimator
+pipeline_globals["runtime_options"] = runtime_options if USE_REAL_QPU else None
+pipeline_globals["runtime_session"] = None
+
+GLOBAL_BACKEND_BUNDLE = {
+    "runtime_estimator": runtime_estimator,
+    "runtime_session": None,
+    "runtime_options": runtime_options if USE_REAL_QPU else None,
+    "runtime_service": service,
+    "aer_quantum_instance": None
+}
+pipeline_globals["GLOBAL_BACKEND_BUNDLE"] = GLOBAL_BACKEND_BUNDLE
+
+logger.info("Injected IBM runtime context into ensemble environment.")
+
+# === Revisa la entrada principal de entrenamiento ===
+if "train_and_evaluate_full_pipeline" not in pipeline_globals:
+    raise RuntimeError("train_and_evaluate_full_pipeline not found in ensemble file.")
+
+train_func = pipeline_globals["train_and_evaluate_full_pipeline"]
+
+# === Conjunto de datos y configuración de ejecución ===
+CSV_PATH = (
+    pipeline_globals.get("CSV_PATH")
+    or os.getenv("CSV_PATH")
+    or r"C:/Users/Acer/Downloads/ACTIVIDADES/Quantum/Proyecto_UNIR/QuantumIBMReal/X_y_resampled.csv"
+)
+
+kwargs = {
+    "path_csv": CSV_PATH,
+    "use_ibm_runtime": USE_REAL_QPU,
+    "backend_name": BACKEND_NAME,
+    "ensemble_strategy": "functional",
+    "out_dir": "./outputs",
+    "seeds": 42
+}
+
+# === Ejecutar la pipeline de entrenamiento ===
+start_time = time.time()
+logger.info(f"Starting hybrid quantum-classical ensemble training on {mode}")
+try:
+    results, train_times, resource_snapshots = train_func(**kwargs)
+    elapsed = time.time() - start_time
+    logger.info("Pipeline completed successfully in %.2f seconds", elapsed)
+
+    logger.info("=== Summary Metrics ===")
+    for name, rr in results.items():
+        logger.info(" • %s: accuracy=%.4f  f1=%.4f", name, rr.get("accuracy", 0.0), rr.get("f1", 0.0))
+
+    logger.info("Training times (seconds):")
+    for name, t in train_times.items():
+        logger.info(" • %s: %.2f", name, t)
+
+    logger.info("All runtime data and figures saved in ./outputs/")
+except Exception as e:
+    logger.exception("Pipeline execution failed: %s", e)
+    raise
