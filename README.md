@@ -1,5 +1,6 @@
 [![DOI](https://zenodo.org/badge/1305803102.svg)](https://doi.org/10.5281/zenodo.21443497)
 
+
 # 🌀 Hybrid Quantum-Classical Ensemble Pipeline
 
 Este proyecto implementa un **pipeline híbrido cuántico-clásico** optimizado que combina modelos cuánticos y clásicos en un esquema de ensamble para tareas de clasificación y análisis de robustez.
