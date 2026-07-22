@@ -70,3 +70,16 @@ El pipeline está diseñado para ser reproducible (GLOBAL_SEED).
 
 - Los modelos cuánticos pueden ejecutarse en hardware real (ibm_kingston) o en simulador local.
 - Los resultados se exportan automáticamente para facilitar análisis y publicación en artículos científicos.
+
+## Licencia
+
+Este proyecto está bajo la **Licencia Pública General de GNU, versión 3 (GPLv3)**.  
+Consulta el archivo [LICENSE](./LICENSE) para más detalles o visita la página oficial:  
+[https://www.gnu.org/licenses/gpl-3.0.html](https://www.gnu.org/licenses/gpl-3.0.html)
+
+---
+
+This project is licensed under the **GNU General Public License v3.0 (GPLv3)**.  
+See the [LICENSE](./LICENSE) file for details or visit the official page:  
+[https://www.gnu.org/licenses/gpl-3.0.html](https://www.gnu.org/licenses/gpl-3.0.html)
+
