@@ -1,4 +1,5 @@
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21443498.svg)](https://doi.org/10.5281/zenodo.21443498)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21443498.svg)]
+
 
 # 🌀 Hybrid Quantum-Classical Ensemble Pipeline
 
