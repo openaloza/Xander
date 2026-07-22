@@ -85,3 +85,6 @@ See the [LICENSE](./LICENSE) file for details or visit the official page:
 [https://www.gnu.org/licenses/gpl-3.0.html](https://www.gnu.org/licenses/gpl-3.0.html)
 
 
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21443498.svg)](https://doi.org/10.5281/zenodo.21443498)
+
